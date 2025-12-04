@@ -62,9 +62,6 @@ def get_dpt_type_for_address(group_address):
 def extract_payload_from_telegram(group_address, telegram):
     dpt_type = get_dpt_type_for_address(group_address)
     payload = telegram.payload
-
-    logging.info("Extracting KNX Payload: Address: {}, DPT Type: {}, Payload: {}".format(group_address, dpt_type, payload))
-
     value = None
 
     try:
@@ -75,8 +72,9 @@ def extract_payload_from_telegram(group_address, telegram):
                 dpt_type = payload.value.__class__.__name__
             dpt_class = getattr(importlib.import_module(XKNX_DPT_MODULE_STR), dpt_type)
             value = dpt_class.from_knx(payload.value)
+            logging.info("extract_payload_from_telegram(): Address: {}, DPT Type: {}, Payload: {}, Value: {}".format(group_address, dpt_type, payload, value))
     except Exception as e:
-        eprint(traceback.format_exc())
+        logging.critical("Exception", exc_info=e)
 
     return value
 
@@ -84,7 +82,7 @@ def extract_payload_from_telegram(group_address, telegram):
 def create_payload_for_telegram(group_address, value):
     dpt_type = get_dpt_type_for_address(group_address)
 
-    logging.info("Creating Payload for KNX: Address: {}, DPT Type: {}, Value: {}".format(group_address, dpt_type, value))
+    logging.info("create_payload_for_telegram(): Address: {}, DPT Type: {}, Value: {}".format(group_address, dpt_type, value))
 
     payload = None
 
@@ -95,7 +93,7 @@ def create_payload_for_telegram(group_address, value):
             dpt_class = getattr(importlib.import_module(XKNX_DPT_MODULE_STR), dpt_type)
             payload = dpt_class.to_knx(value)
     except Exception as e:
-        eprint(traceback.format_exc())
+        logging.critical("Exception", exc_info=e)
 
     return payload
 
@@ -103,7 +101,7 @@ def create_payload_for_telegram(group_address, value):
 def publish_to_knx(address, payload):
     global daemon_args, knx_tunnel
 
-    logging.info("Publish to KNX: Address: {}, Payload: {}".format(address, payload))
+    logging.info("publish_to_knx(): {}, Payload: {}".format(address, payload))
 
     source_address = IndividualAddress(daemon_args.knx_individual_address)
     group_address = GroupAddress(address)
@@ -126,6 +124,10 @@ def publish_to_knx(address, payload):
 def publish_to_mqtt(address, value):
     global mqtt_client, daemon_args, item_states, item_redirects
 
+    if address in item_states and item_states[address] == value:
+        logging.warning("publish_to_mqtt(): Received value for {} is last state sent: {}".format(topic, value))
+        return
+
     if address in item_redirects:
         topic = "{}/{}".format(daemon_args.mqtt_topic, item_redirects[address])
     else:
@@ -133,8 +135,9 @@ def publish_to_mqtt(address, value):
 
     item_states[address] = str(value)
 
-    logging.info("Publisht to MQTT: Topic: {}, Payload: {}".format(topic, value))
+    logging.info("publish_to_mqtt(): Topic: {}, Payload: {}".format(topic, value))
     mqtt_client.publish(topic, str(value), retain=daemon_args.mqtt_retain)
+    
     if daemon_args.timestamp:
         mqtt_client.publish("{}/timestamp".format(topic), time.time(), retain=True)
 
@@ -148,7 +151,7 @@ def on_telegram_received(telegram):
 
         publish_to_mqtt(group_address, payload)
     except Exception as e:
-        eprint(traceback.format_exc())
+        logging.critical("Exception", exc_info=e)
 
 
 def on_mqtt_connect(client, userdata, flags, reason_code, properties):
@@ -156,7 +159,7 @@ def on_mqtt_connect(client, userdata, flags, reason_code, properties):
 
     for address in daemon_args.mqtt_subscribe:
         topic = "{}/{}".format(daemon_args.mqtt_topic, address)
-        logging.info("Subscribe: {}".format(topic))
+        logging.info("on_mqtt_connect(): Subscribe: {}".format(topic))
         client.subscribe(topic)
 
 
@@ -170,19 +173,19 @@ def on_mqtt_received(client, userdata, message):
         if group_address in item_redirects:
             group_address = item_redirects[group_address]
 
-        if item_states[group_address] == value:
-            logging.info("Received value for {} is last state sent: {}".format(group_address, value))
+        if group_address in item_states and item_states[group_address] == value:
+            logging.warning("on_mqtt_received(): Received value for {} is last state sent: {}".format(group_address, value))
             return
         
         if message.retain and not daemon_args.mqtt_resend_retained:
-            logging.info("Received value for {} is a retained value. Not resending due to config: {}".format(group_address, value))
+            logging.warning("on_mqtt_received(): Received value for {} is a retained value. Not resending due to config: {}".format(group_address, value))
             return
         
         payload = create_payload_for_telegram(group_address, value)
 
         publish_to_knx(group_address, payload)
     except Exception as e:
-        eprint(traceback.format_exc())
+        logging.critical("Exception", exc_info=e)
 
 
 def init_mqtt():
