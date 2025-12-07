@@ -20,8 +20,8 @@ from xknx.io.knxip_interface import ConnectionType, ConnectionConfig
 from xknx.telegram.address import GroupAddress, IndividualAddress
 from xknx.telegram.apci import GroupValueWrite
 from xknx.telegram import Telegram, TelegramDirection
+from xknx.core.connection_manager import XknxConnectionState, XknxConnectionType
 from logging.handlers import TimedRotatingFileHandler
-
 
 XKNX_DPT_MODULE_STR = "xknx.dpt"
 
@@ -58,7 +58,6 @@ def get_dpt_type_for_address(group_address):
 
     return dpt_type
 
-
 def extract_payload_from_telegram(group_address, telegram):
     dpt_type = get_dpt_type_for_address(group_address)
     payload = telegram.payload
@@ -72,12 +71,10 @@ def extract_payload_from_telegram(group_address, telegram):
                 dpt_type = payload.value.__class__.__name__
             dpt_class = getattr(importlib.import_module(XKNX_DPT_MODULE_STR), dpt_type)
             value = dpt_class.from_knx(payload.value)
-            logging.info("extract_payload_from_telegram(): Address: {}, DPT Type: {}, Payload: {}, Value: {}".format(group_address, dpt_type, payload, value))
     except Exception as e:
         logging.critical("Exception", exc_info=e)
 
     return value
-
 
 def create_payload_for_telegram(group_address, value):
     dpt_type = get_dpt_type_for_address(group_address)
@@ -96,7 +93,6 @@ def create_payload_for_telegram(group_address, value):
         logging.critical("Exception", exc_info=e)
 
     return payload
-
 
 def publish_to_knx(address, payload):
     global daemon_args, knx_tunnel
@@ -120,7 +116,6 @@ def publish_to_knx(address, payload):
         else:
             asyncio.run(knx_tunnel.telegrams.put(telegram))
 
-
 def publish_to_mqtt(address, value):
     global mqtt_client, daemon_args, item_states, item_redirects
 
@@ -141,18 +136,21 @@ def publish_to_mqtt(address, value):
     if daemon_args.timestamp:
         mqtt_client.publish("{}/timestamp".format(topic), time.time(), retain=True)
 
-
 def on_telegram_received(telegram):
     try:
-        if telegram.direction != TelegramDirection.INCOMING:
-            return
         group_address = str(telegram.destination_address)
-        payload = extract_payload_from_telegram(group_address, telegram)
 
+        if str(telegram).find("GroupValueRead") != -1:
+            #Ignore Read requests.
+            return
+        
+        #logging.info("Received telegram: {}".format(str(telegram)))
+        payload = extract_payload_from_telegram(group_address, telegram)
+        logging.info("on_telegram_received(): Address: {}, Value: {}, Id: {}".format(group_address, payload, id(telegram)))
+   
         publish_to_mqtt(group_address, payload)
     except Exception as e:
         logging.critical("Exception", exc_info=e)
-
 
 def on_mqtt_connect(client, userdata, flags, reason_code, properties):
     global daemon_args
@@ -162,7 +160,6 @@ def on_mqtt_connect(client, userdata, flags, reason_code, properties):
         logging.info("on_mqtt_connect(): Subscribe: {}".format(topic))
         client.subscribe(topic)
 
-
 def on_mqtt_received(client, userdata, message):
     global daemon_args, item_states, item_redirects
 
@@ -170,6 +167,8 @@ def on_mqtt_received(client, userdata, message):
         group_address = message.topic.replace("{}/".format(daemon_args.mqtt_topic), '')
         value = str(message.payload.decode())
 
+        logging.info("Received mqtt message: {} : {}".format(str(message.topic), value))
+        
         if group_address in item_redirects:
             group_address = item_redirects[group_address]
 
@@ -178,7 +177,7 @@ def on_mqtt_received(client, userdata, message):
             return
         
         if message.retain and not daemon_args.mqtt_resend_retained:
-            logging.warning("on_mqtt_received(): Received value for {} is a retained value. Not resending due to config: {}".format(group_address, value))
+            logging.warning("on_mqtt_received(): Received value ({}) for {} is a retained value. Not resending due to config.".format(value, group_address))
             return
         
         payload = create_payload_for_telegram(group_address, value)
@@ -186,7 +185,6 @@ def on_mqtt_received(client, userdata, message):
         publish_to_knx(group_address, payload)
     except Exception as e:
         logging.critical("Exception", exc_info=e)
-
 
 def init_mqtt():
     logging.debug('Starting MQTT')
@@ -212,29 +210,38 @@ def init_mqtt():
     mqtt_client.connect(daemon_args.mqtt_host, daemon_args.mqtt_port, daemon_args.mqtt_keepalive)
     return mqtt_client
 
-
 def start_knx():
     global daemon_args
 
     config = ConnectionConfig(
-            connection_type=ConnectionType.TUNNELING,
-            local_ip=daemon_args.knx_local_ip,
-            gateway_ip=socket.gethostbyname(daemon_args.knx_host),
-            gateway_port=daemon_args.knx_port
-        )
+        connection_type=ConnectionType.TUNNELING,
+        local_ip=daemon_args.knx_local_ip,
+        gateway_ip=socket.gethostbyname(daemon_args.knx_host),
+        gateway_port=daemon_args.knx_port
+    )
+
+    def connection_state_changed(state: XknxConnectionState):
+        logging.getLogger().info("Connection State changed to: {}".format(state))
+        if state == XknxConnectionState.CONNECTED:
+            logging.info("KNX connected.")
+        elif state == XknxConnectionState.DISCONNECTED:
+            logging.warning("KNX disconnected. Stopping service to be restarted.")
+            sys.exit(0)
 
     async def run():
         global knx_tunnel
-        knx_tunnel = XKNX(daemon_mode=True, connection_config=config)
+        knx_tunnel = XKNX(connection_config=config)
         knx_tunnel.telegram_queue.register_telegram_received_cb(
             telegram_received_cb=on_telegram_received,
             group_addresses=daemon_args.knx_subscribe
         )
+        knx_tunnel.connection_manager.register_connection_state_changed_cb(connection_state_changed)
+        logging.getLogger().info("Starting KNX tunnel.")
         await knx_tunnel.start()
-        await knx_tunnel.stop()
+        while True:
+            await asyncio.sleep(1)
 
     asyncio.run(run())
-
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -305,7 +312,6 @@ def parse_args():
     args = parser.parse_args()
     return args
 
-
 def parse_config():
     global daemon_args
 
@@ -361,7 +367,6 @@ def parse_config():
         if 'items' in data:
             daemon_args.items = data['items']
 
-
 def init_items():
     global daemon_args, item_states, item_redirects
 
@@ -373,6 +378,7 @@ def init_items():
     for item in daemon_args.items:
         if not 'knx_subscribe' in item:
             item['knx_subscribe'] = True
+
         if not 'mqtt_subscribe' in item:
             item['mqtt_subscribe'] = False
 
@@ -395,7 +401,6 @@ def init_items():
             if item['knx_subscribe']:
                 daemon_args.knx_subscribe.append(GroupAddress(item['address']))
 
-
 def main():
     global daemon_args, mqtt_client
     daemon_args = parse_args()
@@ -417,13 +422,15 @@ def main():
                       datefmt='%Y-%m-%d %H:%M:%S',
                       level=loglevel,
                       handlers=[
-                        TimedRotatingFileHandler(logDir + "/current.log", when="midnight", interval=1, backupCount=14),
-                        logging.StreamHandler()
+                        TimedRotatingFileHandler(logDir + "/current.log", when="midnight", interval=1, backupCount=14)
                       ])
+
+    logging.getLogger().info("Logger configured.")
 
     # MQTT connection
     mqtt_client = init_mqtt()
     mqtt_client.loop_start()
+
     # KNX connection
     start_knx()
 
